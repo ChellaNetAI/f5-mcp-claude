@@ -1,0 +1,9 @@
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# pycodestyle, pyflakes, bugbear, pyupgrade, bandit (security)
+select = ["E", "F", "W", "B", "UP", "S"]
+# S501: verify=False is an explicit, documented lab option (F5_VERIFY_SSL)
+ignore = ["S501"]

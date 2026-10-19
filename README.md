@@ -1,16 +1,18 @@
 # F5 BIG-IP MCP Server for Claude
 
+[![CI](https://github.com/ChellaNetAI/f5-mcp-claude/actions/workflows/ci.yml/badge.svg)](https://github.com/ChellaNetAI/f5-mcp-claude/actions/workflows/ci.yml)
+
 Talk to your F5 BIG-IP lab in plain English from Claude.
 
 ```
 You    : Which pool members are down?
-Claude : (calls f5_pool_status) /Common/web_pool has 1 of 3 members up.
+Claude : (calls f5_get_pool_status) /Common/web_pool has 1 of 3 members up.
          10.1.20.12:80 and 10.1.20.13:80 are down — monitor http ...
 ```
 
 This is a small [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server written in Python. Claude starts it on your PC, and it talks to the BIG-IP over **iControl REST**.
 
-> **Read-only.** Every tool only sends HTTP `GET` requests. Nothing on the BIG-IP is changed.
+> **Read-only.** Every tool only sends HTTP `GET` requests, and every tool is marked `readOnlyHint: true` / `destructiveHint: false` in MCP, so Claude knows it is safe to call. Nothing on the BIG-IP is changed.
 
 ---
 
@@ -47,7 +49,7 @@ sequenceDiagram
 
     Note over Claude,MCP: At startup Claude launches the server and calls tools/list
     You->>Claude: "Which pool members are down?"
-    Claude->>MCP: tools/call f5_pool_status
+    Claude->>MCP: tools/call f5_get_pool_status
     alt no token yet, or token expiring
         MCP->>F5: POST /mgmt/shared/authn/login
         F5-->>MCP: token (valid ~1200 s)
@@ -61,7 +63,7 @@ sequenceDiagram
 In steps:
 
 1. Claude launches `f5_mcp_server.py` and asks it which tools it has.
-2. You ask a question. Claude picks a tool, for example `f5_pool_status`.
+2. You ask a question. Claude picks a tool, for example `f5_get_pool_status`.
 3. The server logs in with `POST /mgmt/shared/authn/login`, gets an `X-F5-Auth-Token`, and calls `GET /mgmt/tm/ltm/pool?expandSubcollections=true`.
 4. The result goes back to Claude, which answers in plain English.
 
@@ -69,23 +71,27 @@ In steps:
 
 | Tool | What it does | iControl REST call |
 |------|--------------|--------------------|
-| `f5_system_info` | Hostname, TMOS version/build, HA failover state | `/mgmt/tm/sys/version`, `/sys/global-settings`, `/cm/failover-status` |
-| `f5_list_virtual_servers` | Every virtual server with destination, pool, availability, current connections | `/mgmt/tm/ltm/virtual` + `/stats` |
-| `f5_pool_status` | Pools, monitor, and each member's state (up/down/user-disabled) | `/mgmt/tm/ltm/pool?expandSubcollections=true` |
+| `f5_get_system_info` | Hostname, TMOS version/build, HA failover state | `/mgmt/tm/sys/version`, `/sys/global-settings`, `/cm/failover-status` |
+| `f5_list_virtual_servers` | Virtual servers with destination, pool, availability, status reason, current connections. Options: `name_filter`, `limit` (default 50, max 200), `offset` | `/mgmt/tm/ltm/virtual` + `/stats` |
+| `f5_get_pool_status` | Pools, monitor, and each member's state (up/down/user-disabled). Options: `pool` (one pool, e.g. `/Common/web_pool`), `name_filter`, `limit`, `offset` | `/mgmt/tm/ltm/pool?expandSubcollections=true` |
 | `f5_rest_get` | Any read-only GET under `/mgmt/tm/` (monitors, profiles, self IPs, provisioning …) | whatever path Claude needs |
 
-`f5_rest_get` blocks `/mgmt/tm/util/*`, because endpoints like `util/bash` can run commands.
+`f5_rest_get` blocks `/mgmt/tm/util/*` (also URL-encoded forms like `%75til`) and `..`, because endpoints like `util/bash` can run commands. Output is capped at 20,000 characters, so ask Claude to use `?$select=` for big objects.
+
+Large boxes are handled with paging: list tools return 50 objects by default and end with a line like `-- showing 50 of 812 (offset 0); more available, call again with offset=50`. Claude follows that hint on its own.
+
+Errors come back as proper MCP tool errors (`isError: true`) with a hint, for example *"User 'claude-ro' is not allowed to read ... (HTTP 403). Give the user a role that can read this object, e.g. Auditor."*
 
 ### Tool → iControl REST map
 
 ```mermaid
 flowchart LR
-    T1["f5_system_info"] --> E1["/mgmt/tm/sys/version"]
+    T1["f5_get_system_info"] --> E1["/mgmt/tm/sys/version"]
     T1 --> E2["/mgmt/tm/sys/global-settings"]
     T1 --> E3["/mgmt/tm/cm/failover-status"]
     T2["f5_list_virtual_servers"] --> E4["/mgmt/tm/ltm/virtual"]
     T2 --> E5["/mgmt/tm/ltm/virtual/stats"]
-    T3["f5_pool_status"] --> E6["/mgmt/tm/ltm/pool?expandSubcollections=true"]
+    T3["f5_get_pool_status"] --> E6["/mgmt/tm/ltm/pool?expandSubcollections=true"]
     T4["f5_rest_get"] --> E7["any GET /mgmt/tm/*"]
     T4 -. blocked .-x E8["/mgmt/tm/util/*"]
 ```
@@ -94,7 +100,7 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    Q["Claude calls a tool"] --> G1{"Server code:<br/>GET only?<br/>path not /util/?"}
+    Q["Claude calls a tool"] --> G1{"Server code:<br/>GET only? valid input?<br/>path not /util/ or ..?"}
     G1 -->|no| X1["Refused by server"]
     G1 -->|yes| G2{"BIG-IP RBAC:<br/>user role = Guest / Auditor"}
     G2 -->|"write attempt"| X2["401 / 403 from BIG-IP"]
@@ -131,7 +137,7 @@ curl -sk https://<F5_MGMT_IP>/mgmt/shared/authn/login \
   -d '{"username":"claude-ro","password":"Str0ngPass!","loginProviderName":"tmos"}'
 ```
 
-> Depending on the TMOS version, some objects (and stats) may need a higher role such as **Auditor** or **Operator**. If a tool returns HTTP 401 or 403, try **Auditor** next. It is still read-only.
+> **Version note.** Whether a non-admin user can use iControl REST depends on the TMOS version. On older releases (for example 11.x/12.x), REST was limited to Administrator unless the user was added to the `iControl_REST_API_User` role. If the `curl` login above returns 401 for a non-admin user, check the role and your version's documentation. If some objects return 403, try the **Auditor** role next. It is still read-only.
 
 ### 2. Clone and install
 
@@ -166,7 +172,7 @@ F5_VERIFY_SSL=false
 python f5_mcp_server.py
 ```
 
-It should print `Starting F5 MCP server for 192.168.1.245` and then wait for input. Press `Ctrl+C` to stop it. Claude will start the server by itself from now on.
+It should print `Starting f5_mcp for 192.168.1.245` and then wait for input. It also warns if TLS verification is off. Press `Ctrl+C` to stop it. Claude will start the server by itself from now on.
 
 ### 5. Connect to Claude
 
@@ -200,7 +206,7 @@ Open **Settings → Developer → Edit Config**. This opens `claude_desktop_conf
 
 Fully quit Claude Desktop (from the tray icon, not just the window) and open it again. **f5-bigip** should now appear in the tools / connectors menu.
 
-> The server loads `.env` from the folder you launch it in. If Claude Desktop starts it from another folder, put the variables in an `"env": { "F5_HOST": "...", ... }` block in the config instead.
+> The server always reads the `.env` file that sits next to `f5_mcp_server.py`, whatever folder Claude starts it from. You can also put the variables in an `"env": { "F5_HOST": "...", ... }` block in the Claude config. Environment variables set there take priority over `.env`.
 
 #### Claude Code
 
@@ -223,15 +229,21 @@ claude mcp add f5-bigip -- /full/path/.venv/bin/python /full/path/f5_mcp_server.
 | Symptom | Check |
 |---------|-------|
 | Tools don't appear in Claude | Paths in the config must be absolute. Fully restart Claude Desktop. On Windows, check `%APPDATA%\Claude\logs\mcp-server-f5-bigip.log` |
-| `Login failed: HTTP 401` | Wrong user/password, or the user's role has no REST access. Retest with the `curl` login above |
-| Timeout or connection error | Ping the mgmt IP, then run `curl -k https://<ip>/` from the same PC. Check `tmsh list sys httpd allow` |
+| `BIG-IP rejected login ... (HTTP 401)` | Wrong user/password, or the user's role has no REST access on your TMOS version (see the version note in step 1). Retest with the `curl` login above |
+| `Cannot reach BIG-IP` / `did not answer` | Ping the mgmt IP, then run `curl -k https://<ip>/` from the same PC. Check `tmsh list sys httpd allow`. On a busy box, raise `F5_TIMEOUT` |
 | `HTTP 403` on some objects | The user role is too low for that object. Try Auditor |
 
 ## Security notes
 
 - Use a **dedicated read-only user**. RBAC on the BIG-IP is the real guardrail, not the code.
 - Keep credentials in `.env` or the Claude config `env` block. Never put them in the chat.
+- TLS: lab boxes use a self-signed mgmt certificate, so verification is off by default and the server logs a warning. For anything beyond a lab, export the mgmt certificate and set `F5_CA_BUNDLE=/path/to/cert.pem`.
+- Restrict who can reach the mgmt port with `tmsh modify sys httpd allow replace-all-with { <your-PC-IP> }`.
 - This server is intended for **lab** use. Do not point it at production without your change and security process.
+
+## Development
+
+CI (GitHub Actions) runs on every push and once a week. It lints the code with ruff, including security rules, and checks that the server starts and lists 4 read-only tools on MCP SDK 1.x and 2.x. Dependabot opens a pull request when a dependency has a new release.
 
 ## License
 

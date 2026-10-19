@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "30 3 * * 1"   # every Monday - catches breaking MCP SDK releases
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+        mcp: ["mcp<2", "mcp>=2,<3"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: |
+          pip install -r requirements.txt "${{ matrix.mcp }}" ruff
+      - name: Lint (incl. security rules)
+        run: ruff check .
+      - name: Server starts and lists 4 read-only tools
+        run: |
+          python - <<'PY'
+          import asyncio, sys
+          from mcp import ClientSession, StdioServerParameters
+          from mcp.client.stdio import stdio_client
+
+          async def main():
+              p = StdioServerParameters(command=sys.executable, args=["f5_mcp_server.py"])
+              async with stdio_client(p) as (r, w):
+                  async with ClientSession(r, w) as s:
+                      await s.initialize()
+                      tools = (await s.list_tools()).tools
+                      names = sorted(t.name for t in tools)
+                      print(names)
+                      assert len(tools) == 4, names
+                      for t in tools:
+                          a = t.annotations.model_dump(by_alias=True)
+                          assert a["readOnlyHint"] is True and a["destructiveHint"] is False, t.name
+
+          asyncio.run(main())
+          PY
