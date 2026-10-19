@@ -20,7 +20,7 @@ This is a small [Model Context Protocol (MCP)](https://modelcontextprotocol.io/)
 
 ```mermaid
 flowchart LR
-    U(["👤 You<br/>plain-English question"]) --> C["Claude<br/>(Desktop / Code)"]
+    U(["You<br/>plain-English question"]) --> C["Claude<br/>(Desktop / Code)"]
     C <-->|"MCP over stdio<br/>tools/list, tools/call"| S["f5_mcp_server.py<br/>(runs on your PC)"]
     S <-->|"HTTPS 443<br/>iControl REST<br/>X-F5-Auth-Token"| F[("F5 BIG-IP<br/>management IP")]
 
@@ -95,10 +95,10 @@ flowchart LR
 ```mermaid
 flowchart TD
     Q["Claude calls a tool"] --> G1{"Server code:<br/>GET only?<br/>path not /util/?"}
-    G1 -->|no| X1["❌ refused by server"]
+    G1 -->|no| X1["Refused by server"]
     G1 -->|yes| G2{"BIG-IP RBAC:<br/>user role = Guest / Auditor"}
-    G2 -->|"write attempt"| X2["❌ 401 / 403 from BIG-IP"]
-    G2 -->|read| OK["✅ JSON returned to Claude"]
+    G2 -->|"write attempt"| X2["401 / 403 from BIG-IP"]
+    G2 -->|read| OK["JSON returned to Claude"]
 ```
 
 Even if the code had a bug, the BIG-IP user's role would still block any change. That's why the setup below uses a dedicated read-only user.
