@@ -16,15 +16,49 @@ This is a small [Model Context Protocol (MCP)](https://modelcontextprotocol.io/)
 
 ## How it works
 
+### Architecture
+
+```mermaid
+flowchart LR
+    U(["👤 You<br/>plain-English question"]) --> C["Claude<br/>(Desktop / Code)"]
+    C <-->|"MCP over stdio<br/>tools/list, tools/call"| S["f5_mcp_server.py<br/>(runs on your PC)"]
+    S <-->|"HTTPS 443<br/>iControl REST<br/>X-F5-Auth-Token"| F[("F5 BIG-IP<br/>management IP")]
+
+    subgraph PC["Your PC"]
+        C
+        S
+    end
+    subgraph LAB["F5 lab"]
+        F
+    end
 ```
- Claude Desktop / Claude Code
-          │  MCP (stdio)
-          ▼
-   f5_mcp_server.py  (runs on your PC)
-          │  HTTPS 443 — iControl REST, token auth
-          ▼
-   BIG-IP management IP
+
+Claude never talks to the BIG-IP directly. It only calls the tools this server exposes, and the server turns each tool call into iControl REST `GET` requests.
+
+### What happens when you ask a question
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor You
+    participant Claude
+    participant MCP as f5_mcp_server.py
+    participant F5 as BIG-IP (iControl REST)
+
+    Note over Claude,MCP: At startup Claude launches the server and calls tools/list
+    You->>Claude: "Which pool members are down?"
+    Claude->>MCP: tools/call f5_pool_status
+    alt no token yet, or token expiring
+        MCP->>F5: POST /mgmt/shared/authn/login
+        F5-->>MCP: token (valid ~1200 s)
+    end
+    MCP->>F5: GET /mgmt/tm/ltm/pool?expandSubcollections=true<br/>X-F5-Auth-Token
+    F5-->>MCP: JSON: pools + members (state, session)
+    MCP-->>Claude: "web_pool members up 1/3 ..."
+    Claude-->>You: "2 members are down — 10.1.20.12 and 10.1.20.13, http monitor"
 ```
+
+In steps:
 
 1. Claude launches `f5_mcp_server.py` and asks it which tools it has.
 2. You ask a question. Claude picks a tool, for example `f5_pool_status`.
@@ -41,6 +75,33 @@ This is a small [Model Context Protocol (MCP)](https://modelcontextprotocol.io/)
 | `f5_rest_get` | Any read-only GET under `/mgmt/tm/` (monitors, profiles, self IPs, provisioning …) | whatever path Claude needs |
 
 `f5_rest_get` blocks `/mgmt/tm/util/*`, because endpoints like `util/bash` can run commands.
+
+### Tool → iControl REST map
+
+```mermaid
+flowchart LR
+    T1["f5_system_info"] --> E1["/mgmt/tm/sys/version"]
+    T1 --> E2["/mgmt/tm/sys/global-settings"]
+    T1 --> E3["/mgmt/tm/cm/failover-status"]
+    T2["f5_list_virtual_servers"] --> E4["/mgmt/tm/ltm/virtual"]
+    T2 --> E5["/mgmt/tm/ltm/virtual/stats"]
+    T3["f5_pool_status"] --> E6["/mgmt/tm/ltm/pool?expandSubcollections=true"]
+    T4["f5_rest_get"] --> E7["any GET /mgmt/tm/*"]
+    T4 -. blocked .-x E8["/mgmt/tm/util/*"]
+```
+
+### Two layers of read-only protection
+
+```mermaid
+flowchart TD
+    Q["Claude calls a tool"] --> G1{"Server code:<br/>GET only?<br/>path not /util/?"}
+    G1 -->|no| X1["❌ refused by server"]
+    G1 -->|yes| G2{"BIG-IP RBAC:<br/>user role = Guest / Auditor"}
+    G2 -->|"write attempt"| X2["❌ 401 / 403 from BIG-IP"]
+    G2 -->|read| OK["✅ JSON returned to Claude"]
+```
+
+Even if the code had a bug, the BIG-IP user's role would still block any change. That's why the setup below uses a dedicated read-only user.
 
 ---
 
